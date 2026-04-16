@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spider MVP</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <p class="eyebrow">Schema-first Extraction MVP</p>
+        <h1>输入网址，让模型先生成 schema，再按计划抽取</h1>
+        <p class="lead">
+          这个最小版本会先用 Playwright 读取页面快照，再让模型生成 schema 草案。你可以先在聊天框里增删改
+          schema，确认后再开始正式抽取。
+        </p>
+
+        <form id="extract-form" class="form">
+          <label>
+            <span>目标网址</span>
+            <input
+              id="url"
+              name="url"
+              type="url"
+              placeholder="https://www.amazon.com/dp/..."
+              required
+            />
+          </label>
+
+          <label>
+            <span>你想抽什么</span>
+            <textarea
+              id="goal"
+              name="goal"
+              rows="4"
+              placeholder="提取商品标题、价格、评分、评论数和主图"
+              required
+            ></textarea>
+          </label>
+
+          <label>
+            <span>会话 Profile ID</span>
+            <input
+              id="sessionProfileId"
+              name="sessionProfileId"
+              type="text"
+              placeholder="amazon-us-main"
+            />
+          </label>
+
+          <label>
+            <span>最多返回多少条</span>
+            <input
+              id="maxItems"
+              name="maxItems"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="留空则只抓当前页"
+            />
+            <small class="field-hint">留空默认只抓当前页；如果填写 60，当前页不够时会自动翻到下一页继续抓。</small>
+          </label>
+
+          <label>
+            <span>每个商品抓几条评论</span>
+            <input
+              id="reviewsPerItem"
+              name="reviewsPerItem"
+              type="number"
+              min="1"
+              step="1"
+              placeholder="默认 3"
+            />
+            <small class="field-hint">只对进入详情页的商品生效。留空默认抓前 3 条评论。</small>
+          </label>
+
+          <button id="submit-button" type="submit">生成 Schema 草案</button>
+        </form>
+      </section>
+
+      <section class="panel output">
+        <div class="output-header">
+          <h2>Schema Review</h2>
+          <p id="status">等待输入</p>
+        </div>
+
+        <div id="review-workspace" class="review-workspace is-hidden">
+          <section class="review-card">
+            <div class="card-header">
+              <h3>当前 Schema</h3>
+              <button id="reset-button" type="button" class="ghost-button">重新开始</button>
+            </div>
+            <pre id="schema-preview">等待生成 schema 草案...</pre>
+          </section>
+
+          <section class="review-card">
+            <div class="card-header">
+              <h3>修改对话</h3>
+            </div>
+            <div id="chat-log" class="chat-log"></div>
+
+            <form id="chat-form" class="chat-form">
+              <textarea
+                id="chat-input"
+                rows="3"
+                placeholder="例如：删掉 price，把 review_rate 改成 number，再新增 brand 字段"
+              ></textarea>
+
+              <div class="chat-actions">
+                <button id="send-button" type="submit">发送修改</button>
+                <button id="confirm-button" type="button">确认 Schema 并抽取</button>
+              </div>
+            </form>
+          </section>
+        </div>
+
+        <section class="review-card result-card">
+          <div class="card-header">
+            <h3>结果</h3>
+          </div>
+          <pre id="result">{
+  "tip": "先生成 schema 草案，确认后再抽取。",
+  "responseShape": {
+    "ok": true,
+    "totalCount": 24,
+    "result": []
+  }
+}</pre>
+        </section>
+
+        <section class="review-card log-card">
+          <div class="card-header">
+            <h3>抽取日志</h3>
+          </div>
+          <div id="live-log" class="log-output">
+            <div class="log-line log-placeholder">等待开始抽取...</div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
