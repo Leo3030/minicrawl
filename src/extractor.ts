@@ -88,7 +88,7 @@ async function ensureTargetSearchResultsReady(
 
   for (let attempt = 1; attempt <= TARGET_RESULTS_RETRY_COUNT; attempt += 1) {
     const state = await page.evaluate(() => {
-      const pageText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+      const pageText = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
       const productLinkCount = document.querySelectorAll('a[href*="/p/"]').length;
       const targetTitleCount = document.querySelectorAll(
         'a[data-test="@web/ProductCard/title"]',
@@ -984,7 +984,7 @@ export async function capturePage(
           htmlExcerpt: document.documentElement.outerHTML
             .replace(/\s+/g, " ")
             .slice(0, maxHtmlChars),
-          textExcerpt: (document.body.innerText || "").replace(/\s+/g, " ").slice(0, maxTextChars),
+          textExcerpt: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, maxTextChars),
           elements,
         };
       },
@@ -1663,7 +1663,7 @@ async function extractAmazonDetailPayload(
   }
 
   const primaryPayload = await runDetailEvaluation(() => page.evaluate(({ reviewItemsLimit }) => {
-    const collapsedPageText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+    const collapsedPageText = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
     const ratingBreakdownFromText: string[] = [];
     const ratingRegex = /([1-5])\s*star[s]?\s+(\d+%)/gi;
     const seenBreakdownFromText = new Set<string>();
@@ -1930,7 +1930,7 @@ async function extractAmazonDetailPayload(
   );
 
   const fallbackPayload = await runDetailEvaluation(() => page.evaluate(({ reviewItemsLimit }) => {
-    const collapsedPageText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+    const collapsedPageText = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
     const ratingBreakdownFromText: string[] = [];
     const ratingRegex = /([1-5])\s*star[s]?\s+(\d+%)/gi;
     const seenBreakdownFromText = new Set<string>();
@@ -2220,7 +2220,7 @@ async function extractTargetDetailPayload(
   const snapshot = await page.evaluate(() => {
     const mainText = (
       (document.querySelector("#pageBodyContainer") as HTMLElement | null)?.innerText ||
-      document.body.innerText ||
+      document.body?.innerText ||
       ""
     )
       .replace(/\s+/g, " ")
