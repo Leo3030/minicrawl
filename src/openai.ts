@@ -187,6 +187,15 @@ function isAmazonSearchSnapshot(snapshot: PageSnapshot): boolean {
   }
 }
 
+function isTargetSearchSnapshot(snapshot: PageSnapshot): boolean {
+  try {
+    const url = new URL(snapshot.url);
+    return url.hostname.includes("target.") && url.pathname.startsWith("/s");
+  } catch {
+    return false;
+  }
+}
+
 function sanitizePlanForKnownPageContexts(
   plan: ExtractionPlan,
   snapshot: PageSnapshot,
@@ -194,6 +203,141 @@ function sanitizePlanForKnownPageContexts(
     preserveUserShape?: boolean;
   },
 ): ExtractionPlan {
+  if (isTargetSearchSnapshot(snapshot)) {
+    return {
+      ...plan,
+      pageType: "target_search_results",
+      extractionMode: "list",
+      itemContainerSelector: '[data-test="@web/ProductCard/ProductCardVariantDefault"]',
+      itemContainerFallbackSelectors: [
+        '[data-test="@web/ProductCard/body"]',
+        '[data-test="product-details"]',
+      ],
+      fields: plan.fields.map((field) => {
+        const lowerName = field.name.toLowerCase();
+        const isTitleField = lowerName === "title" || lowerName.includes("title");
+        const isUrlField =
+          lowerName === "product_url" ||
+          lowerName === "url" ||
+          lowerName.includes("link") ||
+          (field.attribute === "href" && field.selector.includes("title"));
+        const isImageField =
+          lowerName === "image" || lowerName.includes("image") || field.type === "image";
+        const isPriceField = lowerName === "price" || lowerName.includes("price");
+        const isColorField = lowerName === "color" || lowerName.includes("color");
+        const isReviewRateField =
+          lowerName === "review_rate" ||
+          lowerName === "rating" ||
+          (lowerName.includes("review") && lowerName.includes("rate"));
+        const isReviewDetailField =
+          lowerName === "review_detail" ||
+          lowerName === "review_count" ||
+          (lowerName.includes("review") &&
+            (lowerName.includes("detail") || lowerName.includes("count")));
+        const isDescriptionField =
+          lowerName === "description" || lowerName === "desc" || lowerName.includes("description");
+        const isTypeField = lowerName === "type" || lowerName.includes("category");
+        const isBrandField = lowerName === "brand";
+
+        if (isTitleField) {
+          return {
+            ...field,
+            selector: 'a[data-test="@web/ProductCard/title"]',
+            fallbackSelectors: ['[data-test="product-details"] a[href*="/p/"]'],
+            source: "text",
+            attribute: undefined,
+            transform: "trim",
+            multiple: false,
+          };
+        }
+
+        if (isUrlField) {
+          return {
+            ...field,
+            type: options?.preserveUserShape ? field.type : "url",
+            selector: 'a[data-test="@web/ProductCard/title"]',
+            fallbackSelectors: ['[data-test="product-details"] a[href*="/p/"]'],
+            source: "attribute",
+            attribute: "href",
+            transform: "url",
+            multiple: false,
+          };
+        }
+
+        if (isImageField) {
+          return {
+            ...field,
+            selector: '[data-test="@web/ProductCard/ProductCardImage/primary"] img',
+            fallbackSelectors: ["img"],
+            source: "attribute",
+            attribute: "src",
+            transform: "url",
+            multiple: false,
+          };
+        }
+
+        if (isPriceField) {
+          return {
+            ...field,
+            selector: 'span[data-test="current-price"]',
+            fallbackSelectors: [
+              '[data-test="@web/Price/PriceStandard"]',
+              '[data-test="product-details"]',
+            ],
+            source: "text",
+            attribute: undefined,
+            transform: field.type === "number" ? "number" : "trim",
+            multiple: false,
+          };
+        }
+
+        if (isColorField) {
+          return {
+            ...field,
+            required: options?.preserveUserShape ? field.required : false,
+            selector: 'span[data-test="@web/ProductCard/ProductCardSwatches"]',
+            fallbackSelectors: ['[data-test="product-details"]'],
+            source: "attribute",
+            attribute: "aria-label",
+            transform: "trim",
+            multiple: false,
+          };
+        }
+
+        if (isReviewRateField || isReviewDetailField || isDescriptionField || isTypeField) {
+          return {
+            ...field,
+            required:
+              options?.preserveUserShape || isReviewRateField || isReviewDetailField
+                ? field.required
+                : false,
+            selector: '[data-test="product-details"]',
+            fallbackSelectors: ['[data-test="@web/ProductCard/body"]'],
+            source: "text",
+            attribute: undefined,
+            transform: "trim",
+            multiple: false,
+          };
+        }
+
+        if (isBrandField) {
+          return {
+            ...field,
+            required: options?.preserveUserShape ? field.required : false,
+            selector: '[data-test="@web/ProductCard/ProductCardBrandAndRibbonMessage/brand"]',
+            fallbackSelectors: ['[data-test="product-details"]'],
+            source: "text",
+            attribute: undefined,
+            transform: "trim",
+            multiple: false,
+          };
+        }
+
+        return field;
+      }),
+    };
+  }
+
   if (!isAmazonSearchSnapshot(snapshot)) {
     return plan;
   }

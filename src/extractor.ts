@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+
 import { chromium } from "playwright";
 
 import type {
@@ -14,6 +17,10 @@ const MAX_ELEMENTS = 120;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 45_000;
 const AMAZON_NAVIGATION_TIMEOUT_MS = 65_000;
 const AMAZON_NAVIGATION_RETRIES = 2;
+const TARGET_RESULTS_RETRY_COUNT = 5;
+const TARGET_RESULTS_WAIT_MS = 3_000;
+const PLAYWRIGHT_DEBUG_DIR = path.resolve(process.cwd(), "output/playwright");
+const INTERNAL_TARGET_PRODUCT_URL_FIELD = "__target_product_url";
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -31,9 +38,10 @@ function normalizeSelector(selector: string): string {
 }
 
 function parseNumber(raw: string): number | null {
-  const normalized = raw.replace(/[^0-9.,-]/g, "").replace(/,/g, "");
+  const firstNumber = raw.replace(/\s+/g, " ").match(/-?\d[\d,]*(?:\.\d+)?/);
+  const normalized = firstNumber?.[0]?.replace(/,/g, "") ?? "";
 
-  if (!normalized) {
+  if (!normalized || normalized === "-") {
     return null;
   }
 
@@ -48,6 +56,132 @@ function browserProfileToContextOptions(browserProfile?: BrowserProfile) {
     userAgent: browserProfile?.userAgent ?? DEFAULT_USER_AGENT,
     locale: browserProfile?.locale ?? "en-US",
     timezoneId: browserProfile?.timezoneId ?? "UTC",
+  };
+}
+
+export function isTargetSearchUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    return url.hostname.includes("target.") && url.pathname.startsWith("/s");
+  } catch {
+    return false;
+  }
+}
+
+async function ensureTargetSearchResultsReady(
+  page: import("playwright").Page,
+  logger?: ExtractionLogger,
+): Promise<void> {
+  let lastState:
+    | {
+        pageTitle: string;
+        productLinkCount: number;
+        targetTitleCount: number;
+        productCardCount: number;
+        placeholderCount: number;
+        priceCount: number;
+        currentPriceCount: number;
+        hasErrorDialog: boolean;
+        hasBotChallenge: boolean;
+      }
+    | undefined;
+
+  for (let attempt = 1; attempt <= TARGET_RESULTS_RETRY_COUNT; attempt += 1) {
+    const state = await page.evaluate(() => {
+      const pageText = (document.body.innerText || "").replace(/\s+/g, " ").trim();
+      const productLinkCount = document.querySelectorAll('a[href*="/p/"]').length;
+      const targetTitleCount = document.querySelectorAll(
+        'a[data-test="@web/ProductCard/title"]',
+      ).length;
+      const productCardCount = document.querySelectorAll(
+        '[data-test="@web/ProductCard/ProductCardVariantDefault"]',
+      ).length;
+      const placeholderCount = document.querySelectorAll(
+        '[data-test="@web/site-top-of-funnel/ProductCardPlaceholder"]',
+      ).length;
+      const priceCount = Array.from(document.querySelectorAll("span, div")).filter((element) =>
+        /^\$\s*\d/.test((element.textContent || "").replace(/\s+/g, " ").trim()),
+      ).length;
+      const currentPriceCount = document.querySelectorAll('span[data-test="current-price"]').length;
+
+      return {
+        pageTitle: document.title,
+        productLinkCount,
+        targetTitleCount,
+        productCardCount,
+        placeholderCount,
+        priceCount,
+        currentPriceCount,
+        hasErrorDialog:
+          /something went wrong/i.test(pageText) && /please try again/i.test(pageText),
+        hasBotChallenge:
+          /verify you are human|access denied|captcha|automated access|security check/i.test(pageText),
+      };
+    });
+    lastState = state;
+
+    logExtraction(
+      logger,
+      `Target readiness check ${attempt}/${TARGET_RESULTS_RETRY_COUNT}: title="${state.pageTitle}", product_links=${state.productLinkCount}, target_titles=${state.targetTitleCount}, product_cards=${state.productCardCount}, placeholders=${state.placeholderCount}, prices=${state.priceCount}, current_prices=${state.currentPriceCount}, error_dialog=${state.hasErrorDialog}, bot_challenge=${state.hasBotChallenge}.`,
+      state.productLinkCount > 0 ||
+        state.targetTitleCount > 0 ||
+        state.productCardCount > 0 ||
+        state.priceCount > 0 ||
+        state.currentPriceCount > 0
+        ? "info"
+        : "warn",
+    );
+
+    if (
+      state.productLinkCount > 0 ||
+      state.targetTitleCount > 0 ||
+      state.productCardCount > 0 ||
+      state.priceCount > 0 ||
+      state.currentPriceCount > 0
+    ) {
+      return;
+    }
+
+    if (attempt < TARGET_RESULTS_RETRY_COUNT) {
+      await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+      await page.waitForTimeout(TARGET_RESULTS_WAIT_MS).catch(() => undefined);
+    } else if (state.hasErrorDialog || state.hasBotChallenge) {
+      const artifactPaths = await savePlaywrightDebugArtifacts(page, "target-readiness-failed");
+      throw new Error(
+        `Target returned a degraded search page or bot challenge instead of real product results. Debug screenshot: ${artifactPaths.screenshotPath}. Debug HTML: ${artifactPaths.htmlPath}. Try another IP/session and retry.`,
+      );
+    }
+  }
+
+  const artifactPaths = await savePlaywrightDebugArtifacts(page, "target-readiness-timeout");
+  logExtraction(
+    logger,
+    `Target readiness checks timed out without detecting product cards. Continuing extraction anyway. Debug screenshot: ${artifactPaths.screenshotPath}. Debug HTML: ${artifactPaths.htmlPath}. Last state: ${JSON.stringify(lastState ?? {})}`,
+    "warn",
+  );
+}
+
+async function savePlaywrightDebugArtifacts(
+  page: import("playwright").Page,
+  baseName: string,
+): Promise<{
+  screenshotPath: string;
+  htmlPath: string;
+}> {
+  await mkdir(PLAYWRIGHT_DEBUG_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const screenshotPath = path.join(PLAYWRIGHT_DEBUG_DIR, `${baseName}-${stamp}.png`);
+  const htmlPath = path.join(PLAYWRIGHT_DEBUG_DIR, `${baseName}-${stamp}.html`);
+
+  await page.screenshot({
+    path: screenshotPath,
+    fullPage: true,
+  });
+  await writeFile(htmlPath, await page.content(), "utf8");
+
+  return {
+    screenshotPath,
+    htmlPath,
   };
 }
 
@@ -183,11 +317,257 @@ function findContainersForPlan(
   })();
 }
 
+function inferTargetProductType(title: string | null): string | null {
+  const normalizedTitle = title?.toLowerCase() ?? "";
+
+  if (!normalizedTitle) {
+    return null;
+  }
+
+  const candidates = [
+    "sheet set",
+    "bed sheets",
+    "bed sheet",
+    "bed frame",
+    "headboard",
+    "comforter",
+    "duvet cover",
+    "mattress pad",
+    "blanket",
+    "quilt",
+    "pillow",
+    "sham",
+    "coverlet",
+    "bedspread",
+  ];
+
+  const match = candidates.find((candidate) => normalizedTitle.includes(candidate));
+  return match ?? null;
+}
+
+function extractTargetRatingSummary(bodyText: string | null): {
+  reviewRate: string | null;
+  reviewDetail: string | null;
+} {
+  const normalized = bodyText?.replace(/\s+/g, " ").trim() ?? "";
+
+  if (!normalized) {
+    return {
+      reviewRate: null,
+      reviewDetail: null,
+    };
+  }
+
+  const compact = normalized.replace(/\s+/g, "");
+  const compactMatch = compact.match(/(\d(?:\.\d)?)\(([\d.,]+[kKmM]?)\)/);
+
+  if (compactMatch) {
+    return {
+      reviewRate: compactMatch[1],
+      reviewDetail: compactMatch[2],
+    };
+  }
+
+  const starMatch = normalized.match(/(\d(?:\.\d+)?)\s*out of 5 stars/i);
+  const countMatch = normalized.match(/\(([\d.,]+[kKmM]?)\)/);
+
+  return {
+    reviewRate: starMatch?.[1] ?? null,
+    reviewDetail: countMatch?.[1] ?? null,
+  };
+}
+
+function normalizeTargetFieldValue(
+  field: ExtractionPlan["fields"][number],
+  rawValue: unknown,
+): unknown {
+  if (field.type === "object") {
+    return null;
+  }
+
+  if (field.type === "object[]") {
+    return [];
+  }
+
+  if (field.type === "string[]") {
+    if (Array.isArray(rawValue)) {
+      return rawValue
+        .map((value) => String(value).trim())
+        .filter((value) => value.length > 0);
+    }
+
+    if (typeof rawValue === "string" && rawValue.trim()) {
+      return [rawValue.trim()];
+    }
+
+    return [];
+  }
+
+  if (field.type === "number[]") {
+    if (!Array.isArray(rawValue)) {
+      return [];
+    }
+
+    return rawValue
+      .map((value) => parseNumber(String(value ?? "")))
+      .filter((value): value is number => value !== null);
+  }
+
+  if (field.type === "number") {
+    if (typeof rawValue === "number") {
+      return rawValue;
+    }
+
+    return typeof rawValue === "string" ? parseNumber(rawValue) : null;
+  }
+
+  if (field.type === "boolean") {
+    if (typeof rawValue === "boolean") {
+      return rawValue;
+    }
+
+    if (typeof rawValue === "string") {
+      const lowered = rawValue.toLowerCase();
+      return ["true", "yes", "1", "sponsored"].includes(lowered);
+    }
+
+    return Boolean(rawValue);
+  }
+
+  if (rawValue === null || rawValue === undefined || rawValue === "") {
+    return field.multiple || field.type.endsWith("[]") ? [] : null;
+  }
+
+  if (field.multiple || field.type.endsWith("[]")) {
+    return Array.isArray(rawValue)
+      ? rawValue.map((value) => String(value))
+      : [String(rawValue)];
+  }
+
+  return String(rawValue);
+}
+
+async function extractTargetRecordFromContainer(
+  plan: ExtractionPlan,
+  container: import("playwright").ElementHandle<Node>,
+): Promise<Record<string, unknown>> {
+  const snapshot = await container.evaluate((node) => {
+    const root = node as HTMLElement;
+    const titleElement = root.querySelector(
+      'a[data-test="@web/ProductCard/title"]',
+    ) as HTMLAnchorElement | null;
+    const imageElement = root.querySelector(
+      '[data-test="@web/ProductCard/ProductCardImage/primary"] img, img',
+    ) as HTMLImageElement | null;
+    const currentPriceElement = root.querySelector(
+      'span[data-test="current-price"]',
+    ) as HTMLElement | null;
+    const comparisonPriceElement = root.querySelector(
+      '[data-test="comparison-price"]',
+    ) as HTMLElement | null;
+    const swatchesElement = root.querySelector(
+      'span[data-test="@web/ProductCard/ProductCardSwatches"]',
+    ) as HTMLElement | null;
+    const brandElement = root.querySelector(
+      '[data-test="@web/ProductCard/ProductCardBrandAndRibbonMessage/brand"]',
+    ) as HTMLElement | null;
+    const sponsoredElement = root.querySelector('[data-test="sponsoredText"]') as HTMLElement | null;
+    const detailElement = root.querySelector('[data-test="product-details"]') as HTMLElement | null;
+
+    return {
+      title:
+        (titleElement?.innerText || titleElement?.textContent || "").replace(/\s+/g, " ").trim() || null,
+      productUrl: titleElement?.getAttribute("href") || null,
+      imageUrl: imageElement?.getAttribute("src") || null,
+      currentPrice:
+        (currentPriceElement?.innerText || currentPriceElement?.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim() || null,
+      comparisonPrice:
+        (comparisonPriceElement?.innerText || comparisonPriceElement?.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim() || null,
+      swatchColors: swatchesElement?.getAttribute("aria-label") || null,
+      brand:
+        (brandElement?.innerText || brandElement?.textContent || "").replace(/\s+/g, " ").trim() || null,
+      sponsored:
+        (sponsoredElement?.innerText || sponsoredElement?.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim() || null,
+      detailText:
+        (detailElement?.innerText || detailElement?.textContent || "").replace(/\s+/g, " ").trim() || null,
+      bodyText: (root.innerText || root.textContent || "").replace(/\s+/g, " ").trim() || null,
+    };
+  });
+
+  const ratingSummary = extractTargetRatingSummary(snapshot.bodyText);
+  const inferredType = inferTargetProductType(snapshot.title);
+  const description = snapshot.title ?? snapshot.detailText ?? snapshot.bodyText;
+  const item: Record<string, unknown> = {};
+
+  for (const field of plan.fields) {
+    const lowerName = field.name.toLowerCase();
+    let rawValue: unknown = null;
+
+    if (lowerName === "title" || lowerName.includes("title")) {
+      rawValue = snapshot.title;
+    } else if (
+      lowerName === "product_url" ||
+      lowerName === "url" ||
+      lowerName.includes("link") ||
+      (field.attribute === "href" && field.selector.includes("title"))
+    ) {
+      rawValue = snapshot.productUrl;
+    } else if (lowerName === "image" || lowerName.includes("image") || field.type === "image") {
+      rawValue = snapshot.imageUrl;
+    } else if (lowerName === "price" || lowerName.includes("price")) {
+      rawValue = snapshot.currentPrice ?? snapshot.detailText;
+    } else if (lowerName === "color" || lowerName.includes("color")) {
+      rawValue = snapshot.swatchColors;
+    } else if (
+      lowerName === "review_rate" ||
+      lowerName === "rating" ||
+      (lowerName.includes("review") && lowerName.includes("rate"))
+    ) {
+      rawValue = ratingSummary.reviewRate;
+    } else if (
+      lowerName === "review_detail" ||
+      lowerName === "review_count" ||
+      (lowerName.includes("review") &&
+        (lowerName.includes("detail") || lowerName.includes("count")))
+    ) {
+      rawValue = ratingSummary.reviewDetail;
+    } else if (
+      lowerName === "description" ||
+      lowerName === "desc" ||
+      lowerName.includes("description")
+    ) {
+      rawValue = description;
+    } else if (lowerName === "type" || lowerName.includes("category")) {
+      rawValue = inferredType;
+    } else if (lowerName === "brand") {
+      rawValue = snapshot.brand;
+    } else if (lowerName.includes("sponsored")) {
+      rawValue = snapshot.sponsored;
+    }
+
+    item[field.name] = normalizeTargetFieldValue(field, rawValue);
+  }
+
+  item[INTERNAL_TARGET_PRODUCT_URL_FIELD] = snapshot.productUrl;
+
+  return item;
+}
+
 async function extractRecordFromContainer(
   page: import("playwright").Page,
   plan: ExtractionPlan,
   container: import("playwright").ElementHandle<Node>,
 ): Promise<Record<string, unknown>> {
+  if (isTargetSearchUrl(page.url())) {
+    return extractTargetRecordFromContainer(plan, container);
+  }
+
   const item: Record<string, unknown> = {};
 
   for (const field of plan.fields) {
@@ -207,11 +587,18 @@ async function extractRecordFromContainer(
 function filterExtractedListRecords(
   records: Array<Record<string, unknown>>,
   plan: ExtractionPlan,
+  options?: {
+    logger?: ExtractionLogger;
+  },
 ): Array<Record<string, unknown>> {
   const requiredFieldNames = plan.fields.filter((field) => field.required).map((field) => field.name);
   const seenKeys = new Set<string>();
+  let droppedEmpty = 0;
+  let droppedMissingRequired = 0;
+  let droppedDuplicate = 0;
+  const missingRequiredFieldCounts = new Map<string, number>();
 
-  return records.filter((item) => {
+  const keptRecords = records.filter((item) => {
     const hasMeaningfulValue = Object.values(item).some((value) => {
       if (Array.isArray(value)) {
         return value.length > 0;
@@ -220,18 +607,25 @@ function filterExtractedListRecords(
     });
 
     if (!hasMeaningfulValue) {
+      droppedEmpty += 1;
       return false;
     }
 
-    const hasAllRequiredFields = requiredFieldNames.every((fieldName) => isPresentValue(item[fieldName]));
+    const missingRequiredFields = requiredFieldNames.filter((fieldName) => !isPresentValue(item[fieldName]));
+    const hasAllRequiredFields = missingRequiredFields.length === 0;
 
     if (!hasAllRequiredFields) {
+      droppedMissingRequired += 1;
+      for (const fieldName of missingRequiredFields) {
+        missingRequiredFieldCounts.set(fieldName, (missingRequiredFieldCounts.get(fieldName) ?? 0) + 1);
+      }
       return false;
     }
 
     const dedupeKey = buildGenericDedupeKey(item, requiredFieldNames);
 
     if (dedupeKey && seenKeys.has(dedupeKey)) {
+      droppedDuplicate += 1;
       return false;
     }
 
@@ -241,16 +635,165 @@ function filterExtractedListRecords(
 
     return true;
   });
+
+  logExtraction(
+    options?.logger,
+    `List filter summary: raw=${records.length}, kept=${keptRecords.length}, empty_dropped=${droppedEmpty}, missing_required_dropped=${droppedMissingRequired}, duplicate_dropped=${droppedDuplicate}.`,
+    keptRecords.length === 0 && records.length > 0 ? "warn" : "info",
+  );
+
+  if (missingRequiredFieldCounts.size > 0) {
+    const details = Array.from(missingRequiredFieldCounts.entries())
+      .sort((left, right) => right[1] - left[1])
+      .map(([fieldName, count]) => `${fieldName}:${count}`)
+      .join(", ");
+
+    logExtraction(
+      options?.logger,
+      `Missing required field counts: ${details}`,
+      "warn",
+    );
+  }
+
+  return keptRecords;
 }
 
 async function extractListRecordsFromPage(
   page: import("playwright").Page,
   plan: ExtractionPlan,
+  options?: {
+    logger?: ExtractionLogger;
+  },
 ): Promise<Array<Record<string, unknown>>> {
-  const containers = await findContainersForPlan(page, plan);
+  async function buildAlignedRecords(): Promise<Array<Record<string, unknown>>> {
+    const alignedFieldValues = await Promise.all(
+      plan.fields.map(async (field) => {
+        const rawValues = await extractFieldValues(page, field);
+        const normalizedValues = rawValues
+          .map((value) => normalizeExtractedValue(value, field.transform, page.url()))
+          .filter((value) => value !== "");
+
+        return [field, normalizedValues] as const;
+      }),
+    );
+
+    for (const [field, normalizedValues] of alignedFieldValues) {
+      logExtraction(
+        options?.logger,
+        `Field-aligned fallback selector count for "${field.name}": ${normalizedValues.length}`,
+        "warn",
+      );
+    }
+
+    const rowCount = alignedFieldValues.reduce((maxCount, [, values]) => Math.max(maxCount, values.length), 0);
+
+    if (rowCount === 0) {
+      return [];
+    }
+
+    logExtraction(
+      options?.logger,
+      `Field-aligned fallback found ${rowCount} candidate rows.`,
+      "warn",
+    );
+
+    const rawRecords: Array<Record<string, unknown>> = [];
+
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+      const item: Record<string, unknown> = {};
+
+      for (const [field, normalizedValues] of alignedFieldValues) {
+        if (field.type === "object") {
+          item[field.name] = null;
+          continue;
+        }
+
+        if (field.type === "object[]") {
+          item[field.name] = [];
+          continue;
+        }
+
+        if (field.multiple || field.type.endsWith("[]")) {
+          const rowValue = normalizedValues[rowIndex];
+          item[field.name] = rowValue === undefined ? [] : [rowValue];
+          continue;
+        }
+
+        const rowValue = normalizedValues[rowIndex];
+
+        if (rowValue === undefined) {
+          item[field.name] = null;
+          continue;
+        }
+
+        if (field.type === "number") {
+          item[field.name] =
+            typeof rowValue === "number" ? rowValue : parseNumber(String(rowValue ?? ""));
+          continue;
+        }
+
+        if (field.type === "boolean") {
+          const lowered = String(rowValue).toLowerCase();
+          item[field.name] = lowered.includes("verified purchase") || ["true", "yes", "1"].includes(lowered);
+          continue;
+        }
+
+        item[field.name] = rowValue;
+      }
+
+      rawRecords.push(item);
+    }
+
+    return filterExtractedListRecords(rawRecords, plan, {
+      logger: options?.logger,
+    });
+  }
+
+  let containers = await findContainersForPlan(page, plan);
 
   if (containers.length === 0) {
-    throw new Error("List extraction was requested, but no item containers were found.");
+    logExtraction(
+      options?.logger,
+      "No list item containers matched the plan. Falling back to field-aligned list extraction.",
+      "warn",
+    );
+
+    let alignedRecords = await buildAlignedRecords();
+
+    if (alignedRecords.length > 0) {
+      return alignedRecords;
+    }
+
+    logExtraction(
+      options?.logger,
+      "First pass found no containers or aligned field results. Waiting for dynamic content and retrying.",
+      "warn",
+    );
+
+    if (page.isClosed()) {
+      throw new Error("The page was closed before list extraction retry could run.");
+    }
+
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(1_500).catch(() => undefined);
+
+    if (page.isClosed()) {
+      throw new Error("The page was closed during list extraction retry.");
+    }
+
+    containers = await findContainersForPlan(page, plan);
+
+    if (containers.length === 0) {
+      alignedRecords = await buildAlignedRecords();
+
+      if (alignedRecords.length > 0) {
+        return alignedRecords;
+      }
+
+      throw new Error(
+        "List extraction was requested, but no item containers or field-aligned results were found after retry.",
+      );
+    }
   }
 
   const rawRecords: Array<Record<string, unknown>> = [];
@@ -259,7 +802,9 @@ async function extractListRecordsFromPage(
     rawRecords.push(await extractRecordFromContainer(page, plan, container));
   }
 
-  return filterExtractedListRecords(rawRecords, plan);
+  return filterExtractedListRecords(rawRecords, plan, {
+    logger: options?.logger,
+  });
 }
 
 async function extractFieldValues(
@@ -325,7 +870,13 @@ async function extractFieldValues(
   return [];
 }
 
-export async function capturePage(url: string, browserProfile?: BrowserProfile): Promise<PageSnapshot> {
+export async function capturePage(
+  url: string,
+  browserProfile?: BrowserProfile,
+  options?: {
+    logger?: ExtractionLogger;
+  },
+): Promise<PageSnapshot> {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage(browserProfileToContextOptions(browserProfile));
 
@@ -334,6 +885,11 @@ export async function capturePage(url: string, browserProfile?: BrowserProfile):
       timeoutMs: isAmazonSearchUrl(url) ? AMAZON_NAVIGATION_TIMEOUT_MS : DEFAULT_NAVIGATION_TIMEOUT_MS,
       retries: isAmazonSearchUrl(url) ? AMAZON_NAVIGATION_RETRIES : 0,
     });
+
+    if (isTargetSearchUrl(url)) {
+      logExtraction(options?.logger, "Waiting for Target search results to render.");
+      await ensureTargetSearchResultsReady(page, options?.logger);
+    }
 
     const snapshot = await page.evaluate(
       ({ maxHtmlChars, maxTextChars, maxElements }) => {
@@ -720,6 +1276,161 @@ export function buildAmazonSearchPlan(): ExtractionPlan {
 function normalizeAmazonText(value: string | null | undefined): string | null {
   const trimmed = value?.replace(/\s+/g, " ").trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeTargetText(value: string | null | undefined): string | null {
+  const trimmed = value?.replace(/\s+/g, " ").trim();
+  return trimmed ? trimmed : null;
+}
+
+function stripInternalExtractionFields(record: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(record).filter(([key]) => !key.startsWith("__")),
+  );
+}
+
+function stripInternalExtractionFieldsFromList(
+  records: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return records.map((record) => stripInternalExtractionFields(record));
+}
+
+function absoluteTargetUrl(rawUrl: string | null | undefined): string | null {
+  const normalized = normalizeTargetText(rawUrl);
+
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    return new URL(normalized, "https://www.target.com").toString();
+  } catch {
+    return normalized;
+  }
+}
+
+function buildTargetProductUrl(record: Record<string, unknown>, plan: ExtractionPlan): string | null {
+  const internalUrl =
+    typeof record[INTERNAL_TARGET_PRODUCT_URL_FIELD] === "string"
+      ? record[INTERNAL_TARGET_PRODUCT_URL_FIELD]
+      : null;
+
+  if (internalUrl) {
+    return absoluteTargetUrl(internalUrl);
+  }
+
+  const urlField = plan.fields.find((field) => {
+    const lowerName = field.name.toLowerCase();
+    return (
+      lowerName === "product_url" ||
+      lowerName === "url" ||
+      lowerName.includes("link") ||
+      (field.attribute === "href" && field.selector.includes("title"))
+    );
+  });
+
+  if (!urlField) {
+    return null;
+  }
+
+  const rawUrlCandidate = record[urlField.name];
+  return absoluteTargetUrl(typeof rawUrlCandidate === "string" ? rawUrlCandidate : null);
+}
+
+function splitTargetSectionToItems(sectionText: string | null): string[] {
+  const normalized = normalizeTargetText(sectionText);
+
+  if (!normalized) {
+    return [];
+  }
+
+  const keyValueMatches = Array.from(
+    normalized.matchAll(/([A-Z][A-Za-z0-9 /&"-]{1,40}:\s*.*?)(?=\s+[A-Z][A-Za-z0-9 /&"-]{1,40}:\s*|$)/g),
+  )
+    .map((match) => match[1]?.trim())
+    .filter((value): value is string => Boolean(value));
+
+  if (keyValueMatches.length > 0) {
+    return keyValueMatches;
+  }
+
+  return normalized
+    .split(/\s+(?=[A-Z][a-z][^.]+(?:\s+[A-Z][a-z][^.]+){0,8}(?::|$))/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function extractTargetSection(
+  pageText: string,
+  sectionTitle: string,
+  nextTitles: string[],
+): string | null {
+  const escapedTitle = sectionTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedNextTitles = nextTitles.map((title) => title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const boundary = escapedNextTitles.length > 0 ? escapedNextTitles.join("|") : "$";
+  const pattern = new RegExp(`${escapedTitle}\\s+([\\s\\S]*?)(?=\\s+(?:${boundary})\\b|$)`, "i");
+  const match = pageText.match(pattern);
+
+  return normalizeTargetText(match?.[1] ?? null);
+}
+
+function extractTargetReviewSummary(input: {
+  ratingText: string | null;
+  reviewCountText: string | null;
+  mainText: string;
+}): {
+  rating: string | null;
+  review_count: string | null;
+  question_count: string | null;
+} {
+  const combined = [input.ratingText, input.reviewCountText, input.mainText].filter(Boolean).join(" ");
+  const normalized = combined.replace(/\s+/g, " ").trim();
+  const ratingMatch = normalized.match(/(\d(?:\.\d+)?)\s*out of 5 stars/i);
+  const reviewCountMatch = normalized.match(/with\s+([\d,]+)\s+reviews/i);
+  const questionMatch = normalized.match(/([\d,]+)\s+Questions?/i);
+
+  return {
+    rating: ratingMatch?.[1] ?? null,
+    review_count: reviewCountMatch?.[1]?.replace(/,/g, "") ?? null,
+    question_count: questionMatch?.[1]?.replace(/,/g, "") ?? null,
+  };
+}
+
+function hasTargetDetailFields(
+  plan: ExtractionPlan,
+  options?: {
+    reviewsPerItem?: number;
+  },
+): boolean {
+  const detailFieldNames = new Set([
+    "description",
+    "desc",
+    "brand",
+    "highlights",
+    "features",
+    "specifications",
+    "specs",
+    "details",
+    "about_this_item",
+    "at_a_glance",
+    "shipping",
+    "shipping&returns",
+    "shipping_and_returns",
+    "sold_by",
+    "original_price",
+    "review_summary",
+    "reviews",
+    "question_count",
+    "questions",
+  ]);
+
+  return (
+    Boolean(options?.reviewsPerItem) ||
+    plan.fields.some((field) => {
+      const lowerName = field.name.toLowerCase();
+      return field.type === "object" || field.type === "object[]" || detailFieldNames.has(lowerName);
+    })
+  );
 }
 
 function matchesPlanFieldRole(
@@ -1478,6 +2189,366 @@ async function enrichAmazonRecordWithDetails(
   };
 }
 
+async function extractTargetDetailPayload(
+  page: import("playwright").Page,
+  productUrl: string,
+  options?: {
+    reviewsPerItem?: number;
+    logger?: ExtractionLogger;
+    productLabel?: string;
+  },
+): Promise<{
+  title: string | null;
+  brand: string | null;
+  price: string | null;
+  original_price: string | null;
+  description: string | null;
+  highlights: string[];
+  features: string[];
+  specifications: string[];
+  at_a_glance: string[];
+  sold_by: string | null;
+  shipping: string | null;
+  review_summary: Record<string, unknown>;
+  reviews: Array<Record<string, unknown>>;
+}> {
+  await gotoWithRetry(page, productUrl, {
+    timeoutMs: DEFAULT_NAVIGATION_TIMEOUT_MS,
+  });
+  await page.waitForTimeout(2_000);
+
+  const snapshot = await page.evaluate(() => {
+    const mainText = (
+      (document.querySelector("#pageBodyContainer") as HTMLElement | null)?.innerText ||
+      document.body.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const titleElements = Array.from(document.querySelectorAll('[data-test="product-title"]'));
+    const titleText = titleElements
+      .map((element) => (element.textContent || "").replace(/\s+/g, " ").trim())
+      .find((value) => value.length > 0) || null;
+
+    const ratingText = (
+      (document.querySelector('[data-test="ratings"]') as HTMLElement | null)?.innerText ||
+      (document.querySelector('[data-test="ratingFeedbackContainer"]') as HTMLElement | null)?.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const reviewCountText = (
+      (document.querySelector('[data-test="ratingCountLink"]') as HTMLElement | null)?.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const priceText = (
+      (document.querySelector('[data-test="product-price"]') as HTMLElement | null)?.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const regularPriceText = (
+      (document.querySelector('[data-test="product-regular-price"]') as HTMLElement | null)?.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const detailText = (
+      (document.querySelector('[data-test="item-details-description"]') as HTMLElement | null)?.innerText ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return {
+      mainText,
+      titleText,
+      ratingText: ratingText || null,
+      reviewCountText: reviewCountText || null,
+      priceText: priceText || null,
+      regularPriceText: regularPriceText || null,
+      detailText: detailText || null,
+    };
+  });
+
+  const normalizedPageText = normalizeTargetText(
+    snapshot.detailText ? `${snapshot.mainText} ${snapshot.detailText}` : snapshot.mainText,
+  ) ?? "";
+  const detailSection = extractTargetSection(normalizedPageText, "Details", [
+    "Highlights",
+    "Description",
+    "Features",
+    "Specifications",
+    "Shipping & Returns",
+    "Q&A",
+    "Additional product information",
+    "Load all content at once",
+    "Guest ratings & reviews",
+  ]);
+  const highlights = splitTargetSectionToItems(
+    extractTargetSection(normalizedPageText, "Highlights", [
+      "Description",
+      "Features",
+      "Specifications",
+      "Shipping & Returns",
+      "Q&A",
+      "Additional product information",
+      "Load all content at once",
+      "Guest ratings & reviews",
+    ]),
+  );
+  const description =
+    extractTargetSection(normalizedPageText, "Description", [
+      "Features",
+      "Specifications",
+      "Shipping & Returns",
+      "Q&A",
+      "Additional product information",
+      "Load all content at once",
+      "Guest ratings & reviews",
+    ]) ?? detailSection;
+  const features = splitTargetSectionToItems(
+    extractTargetSection(normalizedPageText, "Features", [
+      "Specifications",
+      "Shipping & Returns",
+      "Q&A",
+      "Additional product information",
+      "Load all content at once",
+      "Guest ratings & reviews",
+    ]),
+  );
+  const specifications = splitTargetSectionToItems(
+    extractTargetSection(normalizedPageText, "Specifications", [
+      "Shipping & Returns",
+      "Q&A",
+      "Additional product information",
+      "Load all content at once",
+      "Guest ratings & reviews",
+      "Disclaimer",
+    ]),
+  );
+  const atAGlance = splitTargetSectionToItems(
+    extractTargetSection(normalizedPageText, "At a glance", [
+      "About this item",
+      "Details",
+      "Highlights",
+      "Description",
+      "Features",
+      "Specifications",
+    ]),
+  );
+  const reviewSummary = extractTargetReviewSummary({
+    ratingText: snapshot.ratingText,
+    reviewCountText: snapshot.reviewCountText,
+    mainText: normalizedPageText,
+  });
+  const soldBy =
+    normalizeTargetText(
+      normalizedPageText.match(/Sold\s*&\s*shipped by\s+(.+?)(?=\s+Report this item|\s+Eligible for registries|\s+At a glance|\s+About this item)/i)?.[1] ??
+        null,
+    ) ?? null;
+  const shipping =
+    normalizeTargetText(
+      normalizedPageText.match(/(Choose delivery method in cart|Same Day Delivery|Ship it|Pickup|Shipping not available|There was a temporary issue.+?)(?=\s+Qty|\s+Add to cart|\s+Sold\s*&\s*shipped by|\s+Report this item)/i)?.[1] ??
+        null,
+    ) ?? null;
+  const brand =
+    normalizeTargetText(
+      normalizedPageText.match(/Shop all\s+(.+?)(?=\s+.+?out of 5 stars|\s+\$|\s+There was a temporary issue)/i)?.[1] ??
+        null,
+    ) ?? null;
+
+  logExtraction(
+    options?.logger,
+    `Loaded Target detail page for ${options?.productLabel ?? productUrl}. Highlights=${highlights.length}, features=${features.length}, specs=${specifications.length}, reviews=${reviewSummary.review_count ?? "0"}.`,
+  );
+
+  return {
+    title: normalizeTargetText(snapshot.titleText),
+    brand,
+    price: normalizeTargetText(snapshot.priceText),
+    original_price: normalizeTargetText(snapshot.regularPriceText),
+    description: normalizeTargetText(description),
+    highlights,
+    features,
+    specifications,
+    at_a_glance: atAGlance,
+    sold_by: soldBy,
+    shipping,
+    review_summary: {
+      review_count: reviewSummary.review_count,
+      rating: reviewSummary.rating,
+      rating_breakdown: [],
+      top_positive_snippet: null,
+      top_critical_snippet: null,
+      question_count: reviewSummary.question_count,
+    },
+    reviews: [],
+  };
+}
+
+function projectTargetDetailValueForField(
+  field: ExtractionPlan["fields"][number],
+  rawValue: unknown,
+): unknown {
+  if (field.type === "object" || field.type === "object[]") {
+    return projectValueForField(field, rawValue);
+  }
+
+  if (field.type === "string[]") {
+    if (Array.isArray(rawValue)) {
+      return rawValue.map((value) => String(value)).filter((value) => value.trim().length > 0);
+    }
+
+    return typeof rawValue === "string" && rawValue.trim().length > 0 ? [rawValue.trim()] : [];
+  }
+
+  if (field.type === "number[]") {
+    if (!Array.isArray(rawValue)) {
+      return [];
+    }
+
+    return rawValue
+      .map((value) => (typeof value === "number" ? value : parseNumber(String(value ?? ""))))
+      .filter((value): value is number => value !== null);
+  }
+
+  if (field.type === "number") {
+    if (typeof rawValue === "number") {
+      return rawValue;
+    }
+
+    return typeof rawValue === "string" ? parseNumber(rawValue) : null;
+  }
+
+  if (field.type === "boolean") {
+    if (typeof rawValue === "boolean") {
+      return rawValue;
+    }
+
+    if (typeof rawValue === "string") {
+      return ["true", "yes", "1"].includes(rawValue.toLowerCase());
+    }
+
+    return Boolean(rawValue);
+  }
+
+  if (Array.isArray(rawValue)) {
+    return rawValue.map((value) => String(value)).join(" ");
+  }
+
+  return rawValue === null || rawValue === undefined || rawValue === "" ? null : String(rawValue);
+}
+
+function getTargetDetailRawValue(
+  field: ExtractionPlan["fields"][number],
+  detailPayload: Awaited<ReturnType<typeof extractTargetDetailPayload>>,
+): unknown {
+  const lowerName = field.name.toLowerCase();
+
+  if (lowerName === "title" || lowerName.includes("title")) {
+    return detailPayload.title;
+  }
+
+  if (lowerName === "brand") {
+    return detailPayload.brand;
+  }
+
+  if (lowerName === "price") {
+    return detailPayload.price;
+  }
+
+  if (lowerName === "original_price" || lowerName.includes("regular_price")) {
+    return detailPayload.original_price;
+  }
+
+  if (lowerName === "description" || lowerName === "desc") {
+    return detailPayload.description;
+  }
+
+  if (lowerName === "highlights") {
+    return detailPayload.highlights;
+  }
+
+  if (lowerName === "features") {
+    return detailPayload.features;
+  }
+
+  if (lowerName === "specifications" || lowerName === "specs") {
+    return detailPayload.specifications;
+  }
+
+  if (lowerName === "details" || lowerName === "about_this_item") {
+    return detailPayload.description;
+  }
+
+  if (lowerName === "at_a_glance") {
+    return detailPayload.at_a_glance;
+  }
+
+  if (lowerName === "shipping" || lowerName === "shipping&returns" || lowerName === "shipping_and_returns") {
+    return detailPayload.shipping;
+  }
+
+  if (lowerName === "sold_by") {
+    return detailPayload.sold_by;
+  }
+
+  if (lowerName === "review_rate" || lowerName === "rating") {
+    return detailPayload.review_summary.rating;
+  }
+
+  if (lowerName === "review_detail" || lowerName === "review_count") {
+    return detailPayload.review_summary.review_count;
+  }
+
+  if (lowerName === "question_count" || lowerName === "questions") {
+    return detailPayload.review_summary.question_count;
+  }
+
+  if (lowerName === "review_summary") {
+    return detailPayload.review_summary;
+  }
+
+  if (lowerName === "reviews") {
+    return detailPayload.reviews;
+  }
+
+  return null;
+}
+
+function enrichTargetRecordWithDetails(
+  plan: ExtractionPlan,
+  record: Record<string, unknown>,
+  detailPayload: Awaited<ReturnType<typeof extractTargetDetailPayload>>,
+): Record<string, unknown> {
+  const enrichedRecord: Record<string, unknown> = { ...record };
+
+  for (const field of plan.fields) {
+    const rawValue = getTargetDetailRawValue(field, detailPayload);
+
+    if (
+      rawValue === null ||
+      rawValue === undefined ||
+      rawValue === "" ||
+      (Array.isArray(rawValue) && rawValue.length === 0)
+    ) {
+      continue;
+    }
+
+    enrichedRecord[field.name] = projectTargetDetailValueForField(field, rawValue);
+  }
+
+  return enrichedRecord;
+}
+
 function looksLikeAmazonNoise(input: {
   title: string | null;
   reviewDetail: string | null;
@@ -1626,7 +2697,9 @@ export async function runAmazonSearchExtraction(
         retries: AMAZON_NAVIGATION_RETRIES,
       });
 
-      const pageRecords = await extractListRecordsFromPage(page, plan);
+      const pageRecords = await extractListRecordsFromPage(page, plan, {
+        logger: options?.logger,
+      });
       logExtraction(
         options?.logger,
         `Search page ${pageCount + 1}: found ${pageRecords.length} raw result cards.`,
@@ -1804,10 +2877,110 @@ export async function runAmazonSearchExtraction(
   }
 }
 
+export async function runTargetSearchExtraction(
+  url: string,
+  plan: ExtractionPlan,
+  browserProfile?: BrowserProfile,
+  options?: {
+    maxItems?: number;
+    reviewsPerItem?: number;
+    logger?: ExtractionLogger;
+  },
+): Promise<Array<Record<string, unknown>>> {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage(browserProfileToContextOptions(browserProfile));
+
+  try {
+    logExtraction(
+      options?.logger,
+      `Starting Target search extraction${options?.maxItems ? ` with maxItems=${options.maxItems}` : " for one page"}${options?.reviewsPerItem ? ` and reviewsPerItem=${options.reviewsPerItem}` : ""}.`,
+    );
+
+    await gotoWithRetry(page, url, {
+      timeoutMs: DEFAULT_NAVIGATION_TIMEOUT_MS,
+    });
+    await ensureTargetSearchResultsReady(page, options?.logger);
+
+    const pageRecords = await extractListRecordsFromPage(page, plan, {
+      logger: options?.logger,
+    });
+    const selectedRecords =
+      options?.maxItems !== undefined ? pageRecords.slice(0, options.maxItems) : pageRecords;
+
+    logExtraction(
+      options?.logger,
+      `Target search page yielded ${pageRecords.length} records; selected ${selectedRecords.length} for enrichment/output.`,
+    );
+
+    if (!hasTargetDetailFields(plan, { reviewsPerItem: options?.reviewsPerItem })) {
+      return stripInternalExtractionFieldsFromList(selectedRecords);
+    }
+
+    logExtraction(
+      options?.logger,
+      `Enriching ${selectedRecords.length} Target products with detail-page data.`,
+    );
+
+    const enrichedRecords: Array<Record<string, unknown>> = [];
+
+    for (const [index, record] of selectedRecords.entries()) {
+      const productUrl = buildTargetProductUrl(record, plan);
+      const productLabel =
+        normalizeTargetText(typeof record.title === "string" ? record.title : null) ?? `item ${index + 1}`;
+
+      if (!productUrl) {
+        logExtraction(
+          options?.logger,
+          `Skipping Target detail enrichment for ${productLabel}; no product URL was found.`,
+          "warn",
+        );
+        enrichedRecords.push(stripInternalExtractionFields(record));
+        continue;
+      }
+
+      try {
+        logExtraction(
+          options?.logger,
+          `Opening Target detail page ${index + 1}/${selectedRecords.length}: ${productLabel}`,
+        );
+        const detailPayload = await extractTargetDetailPayload(page, productUrl, {
+          reviewsPerItem: options?.reviewsPerItem,
+          logger: options?.logger,
+          productLabel,
+        });
+        const enrichedRecord = enrichTargetRecordWithDetails(plan, record, detailPayload);
+        enrichedRecords.push(stripInternalExtractionFields(enrichedRecord));
+      } catch (error) {
+        logExtraction(
+          options?.logger,
+          `Failed to enrich Target detail page for ${productLabel}; returning search-page fields only.`,
+          "warn",
+        );
+        if (error instanceof Error) {
+          logExtraction(options?.logger, error.message, "warn");
+        }
+        enrichedRecords.push(stripInternalExtractionFields(record));
+      }
+    }
+
+    logExtraction(
+      options?.logger,
+      `Target search extraction completed with ${enrichedRecords.length} records.`,
+    );
+
+    return enrichedRecords;
+  } finally {
+    await browser.close();
+  }
+}
+
 export async function runExtraction(
   url: string,
   plan: ExtractionPlan,
   browserProfile?: BrowserProfile,
+  options?: {
+    logger?: ExtractionLogger;
+  },
 ): Promise<Record<string, unknown> | Array<Record<string, unknown>>> {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage(browserProfileToContextOptions(browserProfile));
@@ -1818,8 +2991,17 @@ export async function runExtraction(
       retries: isAmazonSearchUrl(url) ? AMAZON_NAVIGATION_RETRIES : 0,
     });
 
+    if (isTargetSearchUrl(url)) {
+      logExtraction(options?.logger, "Waiting for Target search results to render before extraction.");
+      await ensureTargetSearchResultsReady(page, options?.logger);
+    }
+
     if (plan.extractionMode === "list") {
-      return extractListRecordsFromPage(page, plan);
+      return stripInternalExtractionFieldsFromList(
+        await extractListRecordsFromPage(page, plan, {
+          logger: options?.logger,
+        }),
+      );
     }
 
     const result: Record<string, unknown> = {};
@@ -1833,7 +3015,7 @@ export async function runExtraction(
       result[field.name] = finalizeFieldValue(field, normalizedValues);
     }
 
-    return result;
+    return stripInternalExtractionFields(result);
   } finally {
     await browser.close();
   }

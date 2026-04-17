@@ -7,7 +7,9 @@ import {
   buildAmazonSearchPlan,
   capturePage,
   isAmazonSearchUrl,
+  isTargetSearchUrl,
   runAmazonSearchExtraction,
+  runTargetSearchExtraction,
   runExtraction,
 } from "./extractor.js";
 import { createOpenAIClient, generatePlan, revisePlan } from "./openai.js";
@@ -440,7 +442,9 @@ async function bootstrap() {
           `Running on ${lease.worker.id} (${lease.worker.egressLabel}, ${lease.worker.region}) with profile ${lease.sessionProfile.id}.`,
         );
         log("Capturing page snapshot.");
-        const snapshot = await capturePage(url, lease.sessionProfile.browserProfile);
+        const snapshot = await capturePage(url, lease.sessionProfile.browserProfile, {
+          logger: log,
+        });
         log(`Snapshot captured: ${snapshot.title || snapshot.url}`);
         const plan =
           confirmedPlan && isExtractionPlan(confirmedPlan)
@@ -465,10 +469,23 @@ async function bootstrap() {
                 reviewsPerItem,
                 logger: log,
               })
-            : await runExtraction(url, plan, lease.sessionProfile.browserProfile)
-          : await runExtraction(url, plan, lease.sessionProfile.browserProfile);
+            : await runExtraction(url, plan, lease.sessionProfile.browserProfile, {
+                logger: log,
+              })
+          : isTargetSearchUrl(url) && plan.extractionMode === "list"
+            ? await runTargetSearchExtraction(url, plan, lease.sessionProfile.browserProfile, {
+                maxItems,
+                reviewsPerItem,
+                logger: log,
+              })
+          : await runExtraction(url, plan, lease.sessionProfile.browserProfile, {
+              logger: log,
+            });
 
-        if (!isAmazonSearchUrl(url) || plan.extractionMode !== "list") {
+        if (
+          (!isAmazonSearchUrl(url) && !isTargetSearchUrl(url)) ||
+          plan.extractionMode !== "list"
+        ) {
           log("Base extraction completed.");
         }
 
